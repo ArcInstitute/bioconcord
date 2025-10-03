@@ -13,6 +13,8 @@ pip install -e .
 
 ```
 
+<img width="317" height="316" alt="bioconcord" src="https://github.com/user-attachments/assets/b3883303-44f5-475c-9ec4-dfd9acb35318" />
 
 
-<img width="335" height="338" alt="BioconcordLogo" src="https://github.com/user-attachments/assets/9d7f9c43-006e-40aa-940e-0a29ab156cf5" />
+
+
