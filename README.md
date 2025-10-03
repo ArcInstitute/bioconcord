@@ -11,6 +11,8 @@ git clone git@github.com:ArcInstitute/bioconcord.git
 cd bioconcord
 pip install -e .
 
+```
+
 
 
 <img width="335" height="338" alt="BioconcordLogo" src="https://github.com/user-attachments/assets/9d7f9c43-006e-40aa-940e-0a29ab156cf5" />
