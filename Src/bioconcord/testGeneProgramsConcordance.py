@@ -210,7 +210,7 @@ def run_program_regression(
     return final_results
 
 
-def plot_coef_correlations(pred_res, real_res, ncols=3, figsize_per_plot=5, save_path=None):
+def plot_coef_correlations(pred_res, real_res, ncols=5, figsize_per_plot=5, save_path=None):
     """
     Plot scatterplots of real vs predicted coefficients for each pathway in one figure.
     Also computes Pearson correlations and returns them as a DataFrame.
@@ -234,6 +234,12 @@ def plot_coef_correlations(pred_res, real_res, ncols=3, figsize_per_plot=5, save
     results_df : pd.DataFrame
         DataFrame with pathway name, Pearson r, and p-value.
     """
+
+    commonIndex = pred_res.index[[x in real_res.index for x in pred_res.index ]]
+    pred_res = pred_res.loc[commonIndex,]
+    real_res = real_res.loc[commonIndex,]
+
+    print("alooooo")
 
     coef_cols = [c for c in real_res.columns if c.endswith("_coef")]
     n_features = len(coef_cols)
@@ -279,7 +285,9 @@ def plot_coef_correlations(pred_res, real_res, ncols=3, figsize_per_plot=5, save
 
     return pd.DataFrame(results)
 
-def testGeneProgramsConcordance(pred_adata, real_adata, programs_dict, perturbationsColumn="gene", referenceLevel="non-targeting"):
+def testGeneProgramsConcordance(pred_adata, real_adata, 
+                                programs_dict, perturbationsColumn="gene", 
+                                referenceLevel="non-targeting",ncols=5, figsize_per_plot=5, save_path=None):
 
     pred_adata = score_all_programs(pred_adata, programs_dict)
     real_adata = score_all_programs(real_adata, programs_dict)
@@ -288,7 +296,7 @@ def testGeneProgramsConcordance(pred_adata, real_adata, programs_dict, perturbat
     real_res = run_program_regression(real_adata, perturbationsColumn, referenceLevel, programs_dict.keys())
 
 
-    results_df = plot_coef_correlations(pred_res, real_res)
+    results_df = plot_coef_correlations(pred_res, real_res,ncols, figsize_per_plot, save_path)
     
     return results_df
     
