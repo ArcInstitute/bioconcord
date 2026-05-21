@@ -330,6 +330,21 @@ def test_streaming_h5ad_matches_context_split_in_memory(tmp_path):
         random_state=42,
         return_regressions=True,
     )
+    indexed_results, indexed_pred_regressions, indexed_real_regressions = streaming_gene_program_concordance(
+        pred_path,
+        real_path,
+        programs,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        contextColumn="context",
+        gene_names=genes,
+        chunk_size=5,
+        ctrl_size=2,
+        n_bins=4,
+        random_state=42,
+        score_backend="indexed",
+        return_regressions=True,
+    )
 
     expected_results = []
     for context in pred_regressions:
@@ -358,7 +373,21 @@ def test_streaming_h5ad_matches_context_split_in_memory(tmp_path):
             atol=1e-6,
         )
         pd.testing.assert_frame_equal(
+            indexed_pred_regressions[context],
+            expected_pred,
+            check_exact=False,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        pd.testing.assert_frame_equal(
             real_regressions[context],
+            expected_real,
+            check_exact=False,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        pd.testing.assert_frame_equal(
+            indexed_real_regressions[context],
             expected_real,
             check_exact=False,
             rtol=1e-6,
@@ -371,6 +400,7 @@ def test_streaming_h5ad_matches_context_split_in_memory(tmp_path):
 
     expected_results = pd.concat(expected_results, ignore_index=True)
     pd.testing.assert_frame_equal(results, expected_results, check_exact=False, rtol=1e-6, atol=1e-6)
+    pd.testing.assert_frame_equal(indexed_results, expected_results, check_exact=False, rtol=1e-6, atol=1e-6)
 
 
 def test_streaming_h5ad_without_context_matches_whole_in_memory(tmp_path):

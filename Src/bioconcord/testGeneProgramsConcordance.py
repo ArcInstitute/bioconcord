@@ -231,6 +231,21 @@ def _score_block_from_plans(block, plans):
     return scores
 
 
+def _build_score_matrix(plans, n_vars, dtype=np.float32):
+    score_matrix = np.zeros((n_vars, len(plans)), dtype=dtype)
+    for plan_idx, plan in enumerate(plans):
+        target_weight = dtype(1.0 / len(plan["target_indices"]))
+        np.add.at(score_matrix[:, plan_idx], plan["target_indices"], target_weight)
+        if len(plan["control_indices"]) > 0:
+            control_weight = dtype(1.0 / len(plan["control_indices"]))
+            score_matrix[plan["control_indices"], plan_idx] -= control_weight
+    return score_matrix
+
+
+def _score_block_from_matrix(block, score_matrix):
+    return (block @ score_matrix).astype(np.float64, copy=False)
+
+
 def _empty_regression_accumulators(n_groups, n_programs):
     return {
         "counts": np.zeros(n_groups, dtype=np.float64),
@@ -325,7 +340,11 @@ def _stream_program_regressions_from_h5ad(
     ctrl_size=50,
     n_bins=25,
     random_state=42,
+    score_backend="matrix",
 ):
+    if score_backend not in {"matrix", "indexed"}:
+        raise ValueError("score_backend must be 'matrix' or 'indexed'.")
+
     adata_path = Path(adata_path)
     with h5py.File(adata_path, "r") as h5:
         X = h5["X"]
@@ -374,6 +393,7 @@ def _stream_program_regressions_from_h5ad(
                 context_counts[context_code] += context_block.shape[0]
 
         plans_by_context = {}
+        score_matrices_by_context = {}
         target_perturbations_by_context = {}
         raw_to_target_by_context = {}
         accumulators_by_context = {}
@@ -388,6 +408,11 @@ def _stream_program_regressions_from_h5ad(
                 n_bins=n_bins,
                 random_state=random_state,
             )
+            if score_backend == "matrix":
+                score_matrices_by_context[context_code] = _build_score_matrix(
+                    plans_by_context[context_code],
+                    n_vars,
+                )
             context_mask = context_codes == context_code
             target_perturbations, raw_to_target = _target_perturbations_from_codes(
                 perturbation_codes[context_mask],
@@ -417,7 +442,13 @@ def _stream_program_regressions_from_h5ad(
                     context_block = block[mask]
                     context_perturbation_codes = block_perturbation_codes[mask]
 
-                scores = _score_block_from_plans(context_block, plans_by_context[context_code])
+                if score_backend == "matrix":
+                    scores = _score_block_from_matrix(
+                        context_block,
+                        score_matrices_by_context[context_code],
+                    )
+                else:
+                    scores = _score_block_from_plans(context_block, plans_by_context[context_code])
                 target_codes = raw_to_target_by_context[context_code][context_perturbation_codes]
                 _update_regression_accumulators(
                     accumulators_by_context[context_code],
@@ -449,6 +480,7 @@ def testGeneProgramsConcordanceStreaming(
     ctrl_size=50,
     n_bins=25,
     random_state=42,
+    score_backend="matrix",
     return_regressions=False,
 ):
     """Stream h5ad-backed dense X matrices and score each context independently.
@@ -457,6 +489,9 @@ def testGeneProgramsConcordanceStreaming(
     contextColumn is present, each context is scored with context-specific
     expression bins and regressions, matching the result of splitting the
     AnnData by context before calling the in-memory implementation.
+    score_backend="matrix" computes all program scores for a chunk with one
+    dense matrix multiply per context. score_backend="indexed" keeps the
+    original per-program column-slicing score kernel for stricter parity checks.
     """
 
     pred_gene_names = pred_gene_names if pred_gene_names is not None else gene_names
@@ -473,6 +508,7 @@ def testGeneProgramsConcordanceStreaming(
         ctrl_size=ctrl_size,
         n_bins=n_bins,
         random_state=random_state,
+        score_backend=score_backend,
     )
     real_regressions = _stream_program_regressions_from_h5ad(
         real_adata_path,
@@ -485,6 +521,7 @@ def testGeneProgramsConcordanceStreaming(
         ctrl_size=ctrl_size,
         n_bins=n_bins,
         random_state=random_state,
+        score_backend=score_backend,
     )
 
     pred_contexts = set(pred_regressions)
