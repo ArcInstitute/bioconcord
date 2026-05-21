@@ -40,10 +40,10 @@ regressions = runGeneProgramRegressionsStreaming(
 )
 ```
 
-For large dense `.h5ad` prediction/real pairs, use the streaming concordance
-evaluator instead of loading both AnnData objects into memory. It reuses the
-same regression backend, raw h5py reads, context-aware multiprocessing, and the
-matrix scoring backend:
+For large `.h5ad` prediction/real pairs with dense or CSR `.X`, use the
+streaming concordance evaluator instead of loading both AnnData objects into
+memory. It reuses the same regression backend, raw h5py reads, context-aware
+multiprocessing, and the matrix scoring backend:
 
 ```python
 import pandas as pd
@@ -76,8 +76,7 @@ Notes:
   per-program scoring kernel.
 - The evaluator auto-splits by `contextColumn` when present, so mixed-context
   h5ads are scored as if they had already been split by context.
-- The current streaming implementation supports dense `.X`; CSR `.X` support is
-  planned separately.
+- The streaming implementation supports dense and CSR `.X`; layers and `obsm`
+  matrices are not selected by this API.
 
 <img width="317" height="316" alt="bioconcord" src="https://github.com/user-attachments/assets/b3883303-44f5-475c-9ec4-dfd9acb35318" />
-

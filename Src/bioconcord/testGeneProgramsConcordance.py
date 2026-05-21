@@ -1,7 +1,7 @@
 from Src.utils.libraries import *
 from Src.utils.logger import *
 from joblib import Parallel, delayed
-from scipy.sparse import issparse
+from scipy.sparse import csr_matrix, issparse
 from statsmodels.api import OLS, add_constant
 from statsmodels.stats.multitest import multipletests
 import statsmodels.api as sm
@@ -126,8 +126,57 @@ def _load_gene_names_from_path(path):
     return [str(gene) for gene in genes]
 
 
+def _h5_attr_string(obj, name):
+    value = obj.attrs.get(name)
+    if isinstance(value, bytes):
+        return value.decode()
+    return value
+
+
+def _is_h5ad_csr_matrix(obj):
+    return isinstance(obj, h5py.Group) and _h5_attr_string(obj, "encoding-type") == "csr_matrix"
+
+
+def _h5ad_x_shape(X):
+    if isinstance(X, h5py.Dataset):
+        return X.shape
+    if _is_h5ad_csr_matrix(X):
+        return tuple(int(dim) for dim in X.attrs["shape"])
+    raise NotImplementedError("Streaming currently supports dense and CSR h5ad X matrices only.")
+
+
+def _h5ad_x_dtype(X):
+    if isinstance(X, h5py.Dataset):
+        return X.dtype
+    if _is_h5ad_csr_matrix(X):
+        return X["data"].dtype
+    raise NotImplementedError("Streaming currently supports dense and CSR h5ad X matrices only.")
+
+
+def _read_h5ad_x_block(X, start, end):
+    if isinstance(X, h5py.Dataset):
+        return X[start:end, :]
+    if not _is_h5ad_csr_matrix(X):
+        raise NotImplementedError("Streaming currently supports dense and CSR h5ad X matrices only.")
+
+    _, n_vars = _h5ad_x_shape(X)
+    indptr = np.asarray(X["indptr"][start:end + 1])
+    data_start = int(indptr[0])
+    data_end = int(indptr[-1])
+    local_indptr = indptr - data_start
+    data = np.asarray(X["data"][data_start:data_end])
+    indices = np.asarray(X["indices"][data_start:data_end])
+    return csr_matrix((data, indices, local_indptr), shape=(end - start, n_vars), copy=False)
+
+
+def _sum_x_block_columns(block):
+    if issparse(block):
+        return np.asarray(block.sum(axis=0, dtype=np.float64)).ravel()
+    return block.sum(axis=0, dtype=np.float64)
+
+
 def _resolve_gene_names(h5, gene_names=None):
-    n_vars = h5["X"].shape[1]
+    n_vars = _h5ad_x_shape(h5["X"])[1]
     if gene_names is None:
         resolved = _decode_h5_values(h5["var/_index"][:])
     elif isinstance(gene_names, (str, Path)):
@@ -242,9 +291,15 @@ def _build_score_plans(var_names, gene_means, programs_dict, ctrl_size=50, n_bin
 def _score_block_from_plans(block, plans):
     scores = np.empty((block.shape[0], len(plans)), dtype=np.float64)
     for plan_idx, plan in enumerate(plans):
-        target_expr = block[:, plan["target_indices"]].mean(axis=1)
+        if issparse(block):
+            target_expr = np.asarray(block[:, plan["target_indices"]].mean(axis=1)).ravel()
+        else:
+            target_expr = block[:, plan["target_indices"]].mean(axis=1)
         if len(plan["control_indices"]) > 0:
-            control_expr = block[:, plan["control_indices"]].mean(axis=1)
+            if issparse(block):
+                control_expr = np.asarray(block[:, plan["control_indices"]].mean(axis=1)).ravel()
+            else:
+                control_expr = block[:, plan["control_indices"]].mean(axis=1)
         else:
             control_expr = np.zeros(block.shape[0], dtype=target_expr.dtype)
         scores[:, plan_idx] = target_expr - control_expr
@@ -440,7 +495,7 @@ def _parallel_gene_sums_worker(row_range):
     start, end = row_range
     state = _STREAM_WORKER_STATE
     X = state["X"]
-    block = X[start:end, :]
+    block = _read_h5ad_x_block(X, start, end)
     present_context_codes = state["present_context_codes"]
     partial_sums = {
         code: np.zeros(state["n_vars"], dtype=np.float64)
@@ -454,7 +509,7 @@ def _parallel_gene_sums_worker(row_range):
     block_context_codes = _worker_context_codes(start, end)
     if block_context_codes is None or len(present_context_codes) == 1:
         context_code = present_context_codes[0]
-        partial_sums[context_code] += block.sum(axis=0, dtype=np.float64)
+        partial_sums[context_code] += _sum_x_block_columns(block)
         partial_counts[context_code] += block.shape[0]
         return start, partial_sums, partial_counts
 
@@ -463,7 +518,7 @@ def _parallel_gene_sums_worker(row_range):
         if not mask.any():
             continue
         context_block = block[mask]
-        partial_sums[context_code] += context_block.sum(axis=0, dtype=np.float64)
+        partial_sums[context_code] += _sum_x_block_columns(context_block)
         partial_counts[context_code] += context_block.shape[0]
 
     return start, partial_sums, partial_counts
@@ -473,7 +528,7 @@ def _parallel_regression_worker(row_range):
     start, end = row_range
     state = _STREAM_WORKER_STATE
     X = state["X"]
-    block = X[start:end, :]
+    block = _read_h5ad_x_block(X, start, end)
     present_context_codes = state["present_context_codes"]
     program_names = state["program_names"]
 
@@ -654,11 +709,8 @@ def _stream_program_regressions_from_h5ad(
     adata_path = Path(adata_path)
     with h5py.File(adata_path, "r") as h5:
         X = h5["X"]
-        if not isinstance(X, h5py.Dataset):
-            raise NotImplementedError("Streaming currently supports dense h5ad X datasets only.")
-
-        n_obs, n_vars = X.shape
-        x_dtype = X.dtype
+        n_obs, n_vars = _h5ad_x_shape(X)
+        x_dtype = _h5ad_x_dtype(X)
         var_names = _resolve_gene_names(h5, gene_names)
         perturbation_codes, perturbation_categories = _read_h5ad_obs_column(h5, perturbationsColumn)
         context_codes, context_categories = _maybe_read_h5ad_obs_column(h5, contextColumn)
@@ -699,7 +751,7 @@ def _stream_program_regressions_from_h5ad(
             }
 
             for start, end in row_ranges:
-                block = X[start:end, :]
+                block = _read_h5ad_x_block(X, start, end)
                 block_context_codes = context_codes[start:end]
                 for context_code in present_context_codes:
                     if len(present_context_codes) == 1:
@@ -709,7 +761,7 @@ def _stream_program_regressions_from_h5ad(
                         if not mask.any():
                             continue
                         context_block = block[mask]
-                    gene_sums[context_code] += context_block.sum(axis=0, dtype=np.float64)
+                    gene_sums[context_code] += _sum_x_block_columns(context_block)
                     context_counts[context_code] += context_block.shape[0]
     else:
         gene_sums, context_counts = _run_parallel_gene_sums(
@@ -766,7 +818,7 @@ def _stream_program_regressions_from_h5ad(
                 )
 
             for start, end in row_ranges:
-                block = X[start:end, :]
+                block = _read_h5ad_x_block(X, start, end)
                 block_context_codes = context_codes[start:end]
                 block_perturbation_codes = perturbation_codes[start:end]
                 for context_code in present_context_codes:
@@ -842,7 +894,7 @@ def runGeneProgramRegressionsStreaming(
     output_path=None,
     source_label=None,
 ):
-    """Stream one dense h5ad X matrix and return gene-program regressions.
+    """Stream one dense or CSR h5ad X matrix and return gene-program regressions.
 
     This computes the per-context regression tables used internally by
     testGeneProgramsConcordanceStreaming. If output_path is provided, it also
@@ -896,7 +948,7 @@ def testGeneProgramsConcordanceStreaming(
     multiprocessing_start_method=None,
     return_regressions=False,
 ):
-    """Stream h5ad-backed dense X matrices and score each context independently.
+    """Stream h5ad-backed dense or CSR X matrices and score each context independently.
 
     This path uses h5py directly for obs metadata and X chunk reads. If
     contextColumn is present, each context is scored with context-specific

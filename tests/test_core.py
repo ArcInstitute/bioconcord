@@ -310,6 +310,25 @@ def _write_h5ad_with_numeric_var_names(adata, path):
     h5ad.write_h5ad(path)
 
 
+def _write_csr_h5ad_with_numeric_var_names(adata, path):
+    h5ad = adata.copy()
+    h5ad.X = sp.csr_matrix(h5ad.X)
+    h5ad.var_names = [str(i) for i in range(h5ad.n_vars)]
+    h5ad.write_h5ad(path)
+
+
+def _assert_regression_dicts_close(actual, expected):
+    assert set(actual) == set(expected)
+    for context in expected:
+        pd.testing.assert_frame_equal(
+            actual[context],
+            expected[context],
+            check_exact=False,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+
+
 def test_run_gene_program_regressions_streaming_matches_context_split_and_writes_csv(tmp_path):
     _, real_adata, programs, genes = _make_streaming_adatas()
     real_path = tmp_path / "real.h5ad"
@@ -408,6 +427,46 @@ def test_run_gene_program_regressions_streaming_without_context_returns_all(tmp_
         rtol=1e-6,
         atol=1e-6,
     )
+
+
+def test_run_gene_program_regressions_streaming_supports_csr_x(tmp_path):
+    _, real_adata, programs, genes = _make_streaming_adatas()
+    dense_path = tmp_path / "real_dense.h5ad"
+    csr_path = tmp_path / "real_csr.h5ad"
+    _write_h5ad_with_numeric_var_names(real_adata, dense_path)
+    _write_csr_h5ad_with_numeric_var_names(real_adata, csr_path)
+
+    for score_backend, n_workers in [("matrix", 1), ("indexed", 1), ("matrix", 2)]:
+        expected = runGeneProgramRegressionsStreaming(
+            dense_path,
+            programs,
+            perturbationsColumn="perturbation",
+            referenceLevel="control",
+            contextColumn="context",
+            gene_names=genes,
+            chunk_size=5,
+            ctrl_size=2,
+            n_bins=4,
+            random_state=42,
+            score_backend=score_backend,
+        )
+        actual = runGeneProgramRegressionsStreaming(
+            csr_path,
+            programs,
+            perturbationsColumn="perturbation",
+            referenceLevel="control",
+            contextColumn="context",
+            gene_names=genes,
+            chunk_size=5,
+            ctrl_size=2,
+            n_bins=4,
+            random_state=42,
+            score_backend=score_backend,
+            n_workers=n_workers,
+            worker_blas_threads=1,
+        )
+
+        _assert_regression_dicts_close(actual, expected)
 
 
 def test_streaming_h5ad_matches_context_split_in_memory(tmp_path):
@@ -533,6 +592,58 @@ def test_streaming_h5ad_matches_context_split_in_memory(tmp_path):
     pd.testing.assert_frame_equal(results, expected_results, check_exact=False, rtol=1e-6, atol=1e-6)
     pd.testing.assert_frame_equal(indexed_results, expected_results, check_exact=False, rtol=1e-6, atol=1e-6)
     pd.testing.assert_frame_equal(parallel_results, expected_results, check_exact=False, rtol=1e-6, atol=1e-6)
+
+
+def test_streaming_concordance_supports_csr_x(tmp_path):
+    pred_adata, real_adata, programs, genes = _make_streaming_adatas()
+    dense_pred_path = tmp_path / "pred_dense.h5ad"
+    dense_real_path = tmp_path / "real_dense.h5ad"
+    csr_pred_path = tmp_path / "pred_csr.h5ad"
+    csr_real_path = tmp_path / "real_csr.h5ad"
+    _write_h5ad_with_numeric_var_names(pred_adata, dense_pred_path)
+    _write_h5ad_with_numeric_var_names(real_adata, dense_real_path)
+    _write_csr_h5ad_with_numeric_var_names(pred_adata, csr_pred_path)
+    _write_csr_h5ad_with_numeric_var_names(real_adata, csr_real_path)
+
+    expected = streaming_gene_program_concordance(
+        dense_pred_path,
+        dense_real_path,
+        programs,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        contextColumn="context",
+        gene_names=genes,
+        chunk_size=5,
+        ctrl_size=2,
+        n_bins=4,
+        random_state=42,
+    )
+    actual, actual_pred_regressions, actual_real_regressions = streaming_gene_program_concordance(
+        csr_pred_path,
+        csr_real_path,
+        programs,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        contextColumn="context",
+        gene_names=genes,
+        chunk_size=5,
+        ctrl_size=2,
+        n_bins=4,
+        random_state=42,
+        n_workers=2,
+        worker_blas_threads=1,
+        return_regressions=True,
+    )
+
+    pd.testing.assert_frame_equal(
+        actual,
+        expected,
+        check_exact=False,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert set(actual_pred_regressions) == {"ctx_a", "ctx_b"}
+    assert set(actual_real_regressions) == {"ctx_a", "ctx_b"}
 
 
 def test_streaming_h5ad_without_context_matches_whole_in_memory(tmp_path):
