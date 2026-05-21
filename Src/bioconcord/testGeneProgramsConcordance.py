@@ -357,6 +357,29 @@ def _coef_correlations_dataframe(pred_res, real_res):
     return pd.DataFrame(results)
 
 
+def _regression_results_to_long(regression_results, source_label):
+    rows = []
+    for context, regression_df in regression_results.items():
+        perturbations = regression_df.index.astype(str)
+        coef_cols = [col for col in regression_df.columns if col.endswith("_coef")]
+        for coef_col in coef_cols:
+            pathway = coef_col.replace("_coef", "")
+            pval_col = f"{pathway}_pval"
+            rows.append(pd.DataFrame({
+                "source": source_label,
+                "context": context,
+                "perturbation": perturbations,
+                "pathway": pathway,
+                "coef": regression_df[coef_col].to_numpy(),
+                "pval": regression_df[pval_col].to_numpy(),
+            }))
+
+    columns = ["source", "context", "perturbation", "pathway", "coef", "pval"]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(rows, ignore_index=True)[columns]
+
+
 def _row_ranges(n_obs, chunk_size):
     return [
         (start, min(start + chunk_size, n_obs))
@@ -801,6 +824,58 @@ def _stream_program_regressions_from_h5ad(
     return regression_results
 
 
+def runGeneProgramRegressionsStreaming(
+    adata_path,
+    programs_dict,
+    perturbationsColumn="gene",
+    referenceLevel="non-targeting",
+    contextColumn="context",
+    gene_names=None,
+    chunk_size=25000,
+    ctrl_size=50,
+    n_bins=25,
+    random_state=42,
+    score_backend="matrix",
+    n_workers=1,
+    worker_blas_threads=1,
+    multiprocessing_start_method=None,
+    output_path=None,
+    source_label=None,
+):
+    """Stream one dense h5ad X matrix and return gene-program regressions.
+
+    This computes the per-context regression tables used internally by
+    testGeneProgramsConcordanceStreaming. If output_path is provided, it also
+    writes a long CSV with source, context, perturbation, pathway, coef, and
+    pval columns. The Python return value is always a dict mapping context
+    labels to wide regression DataFrames.
+    """
+
+    regressions = _stream_program_regressions_from_h5ad(
+        adata_path,
+        programs_dict,
+        perturbationsColumn=perturbationsColumn,
+        referenceLevel=referenceLevel,
+        contextColumn=contextColumn,
+        gene_names=gene_names,
+        chunk_size=chunk_size,
+        ctrl_size=ctrl_size,
+        n_bins=n_bins,
+        random_state=random_state,
+        score_backend=score_backend,
+        n_workers=n_workers,
+        worker_blas_threads=worker_blas_threads,
+        multiprocessing_start_method=multiprocessing_start_method,
+    )
+
+    if output_path is not None:
+        source_label = Path(adata_path).stem if source_label is None else source_label
+        long_results = _regression_results_to_long(regressions, source_label)
+        long_results.to_csv(output_path, index=False)
+
+    return regressions
+
+
 def testGeneProgramsConcordanceStreaming(
     pred_adata_path,
     real_adata_path,
@@ -837,7 +912,7 @@ def testGeneProgramsConcordanceStreaming(
     pred_gene_names = pred_gene_names if pred_gene_names is not None else gene_names
     real_gene_names = real_gene_names if real_gene_names is not None else gene_names
 
-    pred_regressions = _stream_program_regressions_from_h5ad(
+    pred_regressions = runGeneProgramRegressionsStreaming(
         pred_adata_path,
         programs_dict,
         perturbationsColumn=perturbationsColumn,
@@ -853,7 +928,7 @@ def testGeneProgramsConcordanceStreaming(
         worker_blas_threads=worker_blas_threads,
         multiprocessing_start_method=multiprocessing_start_method,
     )
-    real_regressions = _stream_program_regressions_from_h5ad(
+    real_regressions = runGeneProgramRegressionsStreaming(
         real_adata_path,
         programs_dict,
         perturbationsColumn=perturbationsColumn,

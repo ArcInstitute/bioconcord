@@ -15,9 +15,35 @@ pip install -e .
 
 ## Fast Gene Program Concordance on Large h5ad Files
 
-For large dense `.h5ad` prediction/real pairs, use the streaming evaluator instead
-of loading both AnnData objects into memory. The fastest path uses raw h5py reads,
-context-aware multiprocessing, and the matrix scoring backend:
+For one ground-truth AnnData, use the streaming regression API to compute and
+optionally save per-context gene-program regression tables:
+
+```python
+import pandas as pd
+from Src.bioconcord import runGeneProgramRegressionsStreaming
+
+programs_df = pd.read_csv("GeneModules.csv", index_col=0)
+programs = programs_df.groupby(programs_df.columns[-1])["GeneName"].apply(
+    lambda s: list(pd.unique(s.dropna().astype(str)))
+).to_dict()
+
+regressions = runGeneProgramRegressionsStreaming(
+    adata_path="/path/to/adata_real.h5ad",
+    programs_dict=programs,
+    perturbationsColumn="perturbation",
+    referenceLevel="control",
+    contextColumn="context",
+    output_path="adata_real_gene_program_regressions.csv",
+    chunk_size=25000,
+    n_workers=8,
+    worker_blas_threads=1,
+)
+```
+
+For large dense `.h5ad` prediction/real pairs, use the streaming concordance
+evaluator instead of loading both AnnData objects into memory. It reuses the
+same regression backend, raw h5py reads, context-aware multiprocessing, and the
+matrix scoring backend:
 
 ```python
 import pandas as pd
@@ -50,8 +76,8 @@ Notes:
   per-program scoring kernel.
 - The evaluator auto-splits by `contextColumn` when present, so mixed-context
   h5ads are scored as if they had already been split by context.
+- The current streaming implementation supports dense `.X`; CSR `.X` support is
+  planned separately.
 
 <img width="317" height="316" alt="bioconcord" src="https://github.com/user-attachments/assets/b3883303-44f5-475c-9ec4-dfd9acb35318" />
-
-
 

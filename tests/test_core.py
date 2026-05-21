@@ -7,6 +7,7 @@ from scipy.sparse import issparse
 
 from Src.bioconcord.testGeneProgramsConcordance import (
     _coef_correlations_dataframe,
+    runGeneProgramRegressionsStreaming,
     run_program_regression,
     score_all_programs,
     score_genes_standalone,
@@ -307,6 +308,106 @@ def _write_h5ad_with_numeric_var_names(adata, path):
     h5ad = adata.copy()
     h5ad.var_names = [str(i) for i in range(h5ad.n_vars)]
     h5ad.write_h5ad(path)
+
+
+def test_run_gene_program_regressions_streaming_matches_context_split_and_writes_csv(tmp_path):
+    _, real_adata, programs, genes = _make_streaming_adatas()
+    real_path = tmp_path / "real.h5ad"
+    output_path = tmp_path / "real_regressions.csv"
+    _write_h5ad_with_numeric_var_names(real_adata, real_path)
+
+    regressions = runGeneProgramRegressionsStreaming(
+        real_path,
+        programs,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        contextColumn="context",
+        gene_names=genes,
+        chunk_size=5,
+        ctrl_size=2,
+        n_bins=4,
+        random_state=42,
+        output_path=output_path,
+    )
+
+    expected_regressions = {}
+    for context in regressions:
+        real_context = real_adata[real_adata.obs["context"] == context].copy()
+        score_all_programs(real_context, programs, n_jobs=1, ctrl_size=2, n_bins=4, random_state=42)
+        expected_regressions[context] = run_program_regression(
+            real_context,
+            perturbationsColumn="perturbation",
+            referenceLevel="control",
+            pathways=programs.keys(),
+        )
+        pd.testing.assert_frame_equal(
+            regressions[context],
+            expected_regressions[context],
+            check_exact=False,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+
+    expected_rows = []
+    for context, regression_df in expected_regressions.items():
+        for pathway in programs:
+            for perturbation, row in regression_df.iterrows():
+                expected_rows.append({
+                    "source": real_path.stem,
+                    "context": context,
+                    "perturbation": str(perturbation),
+                    "pathway": pathway,
+                    "coef": row[f"{pathway}_coef"],
+                    "pval": row[f"{pathway}_pval"],
+                })
+    expected_long = pd.DataFrame(expected_rows)
+    actual_long = pd.read_csv(output_path)
+    expected_long = expected_long.sort_values(["context", "pathway", "perturbation"]).reset_index(drop=True)
+    actual_long = actual_long.sort_values(["context", "pathway", "perturbation"]).reset_index(drop=True)
+    pd.testing.assert_frame_equal(
+        actual_long,
+        expected_long,
+        check_exact=False,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_run_gene_program_regressions_streaming_without_context_returns_all(tmp_path):
+    _, real_adata, programs, _ = _make_streaming_adatas()
+    real_adata.obs = real_adata.obs.drop(columns=["context"])
+    real_path = tmp_path / "real_no_context.h5ad"
+    real_adata.write_h5ad(real_path)
+
+    regressions = runGeneProgramRegressionsStreaming(
+        real_path,
+        programs,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        contextColumn=None,
+        chunk_size=4,
+        ctrl_size=2,
+        n_bins=4,
+        random_state=42,
+    )
+
+    expected_adata = real_adata.copy()
+    score_all_programs(expected_adata, programs, n_jobs=1, ctrl_size=2, n_bins=4, random_state=42)
+    expected = run_program_regression(
+        expected_adata,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        pathways=programs.keys(),
+    )
+
+    assert set(regressions) == {"all"}
+    pd.testing.assert_frame_equal(
+        regressions["all"],
+        expected,
+        check_exact=False,
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_streaming_h5ad_matches_context_split_in_memory(tmp_path):
