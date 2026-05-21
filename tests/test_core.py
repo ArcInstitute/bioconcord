@@ -2,9 +2,11 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import statsmodels.api as sm
 from scipy.sparse import issparse
 
 from Src.bioconcord.testGeneProgramsConcordance import (
+    run_program_regression,
     score_all_programs,
     score_genes_standalone,
 )
@@ -69,6 +71,47 @@ def _reference_score_genes_standalone(
     scores = target_expr - control_expr
 
     return pd.Series(scores, index=adata.obs_names, name=prog_name)
+
+
+def _reference_run_program_regression(
+    adata,
+    perturbationsColumn="gene",
+    referenceLevel="non-targeting",
+    pathways=None,
+):
+    targetPerturbations = list(adata.obs[perturbationsColumn].unique())
+    targetPerturbations.sort()
+    targetPerturbations = (
+        [referenceLevel]
+        + targetPerturbations[:targetPerturbations.index(referenceLevel)]
+        + targetPerturbations[targetPerturbations.index(referenceLevel) + 1:]
+    )
+
+    adata.obs[perturbationsColumn] = pd.Categorical(
+        adata.obs[perturbationsColumn],
+        categories=targetPerturbations,
+        ordered=True,
+    )
+    designMatrix = pd.get_dummies(
+        adata.obs[perturbationsColumn],
+        drop_first=True,
+    )
+
+    if pathways is None:
+        expressionMatrix = adata.obs.select_dtypes(include="number")
+    else:
+        expressionMatrix = adata.obs[pathways]
+
+    all_results = []
+    for col in expressionMatrix.columns:
+        model = sm.OLS(expressionMatrix[col], designMatrix).fit()
+        results_df = pd.DataFrame({
+            "coef": model.params,
+            "pval": model.pvalues,
+        })
+        all_results.append(results_df.add_prefix(f"{col}_"))
+
+    return pd.concat(all_results, axis=1)
 
 
 def _adata_with_matrix(X):
@@ -155,3 +198,67 @@ def test_score_all_programs_matches_reference_with_threading():
             expected_adata.obs[prog_name],
             check_exact=True,
         )
+
+
+def test_run_program_regression_matches_statsmodels_reference():
+    obs = pd.DataFrame({
+        "perturbation": [
+            "b",
+            "control",
+            "a",
+            "c",
+            "a",
+            "b",
+            "control",
+            "c",
+            "a",
+            "d",
+            "d",
+            "control",
+        ],
+        "program_a": np.array([1.0, 0.2, 1.4, -0.3, 2.0, 0.9, 0.4, -0.6, 1.1, 3.0, 2.7, 0.1]),
+        "program_b": np.array([0.5, -0.2, 2.4, 1.3, 2.2, 0.7, -0.4, 1.6, 2.1, 0.0, 0.3, -0.1]),
+    })
+    var = pd.DataFrame(index=["g0", "g1"])
+    actual_adata = ad.AnnData(X=np.ones((len(obs), 2)), obs=obs.copy(), var=var)
+    expected_adata = ad.AnnData(X=np.ones((len(obs), 2)), obs=obs.copy(), var=var)
+
+    actual = run_program_regression(
+        actual_adata,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        pathways=["program_a", "program_b"],
+    )
+    expected = _reference_run_program_regression(
+        expected_adata,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        pathways=["program_a", "program_b"],
+    )
+
+    pd.testing.assert_frame_equal(actual, expected, check_exact=False, rtol=1e-12, atol=1e-12)
+
+
+def test_run_program_regression_matches_statsmodels_reference_default_pathways():
+    obs = pd.DataFrame({
+        "perturbation": ["control", "x", "y", "x", "control", "y", "z", "z"],
+        "program_a": np.array([1.0, 1.2, -0.8, 1.4, 0.7, -0.4, 2.0, 2.2]),
+        "program_b": np.array([0.2, 0.4, 1.8, 0.6, -0.1, 1.5, -2.0, -1.8]),
+        "label": ["a", "b", "c", "d", "e", "f", "g", "h"],
+    })
+    var = pd.DataFrame(index=["g0", "g1"])
+    actual_adata = ad.AnnData(X=np.ones((len(obs), 2)), obs=obs.copy(), var=var)
+    expected_adata = ad.AnnData(X=np.ones((len(obs), 2)), obs=obs.copy(), var=var)
+
+    actual = run_program_regression(
+        actual_adata,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+    )
+    expected = _reference_run_program_regression(
+        expected_adata,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+    )
+
+    pd.testing.assert_frame_equal(actual, expected, check_exact=False, rtol=1e-12, atol=1e-12)

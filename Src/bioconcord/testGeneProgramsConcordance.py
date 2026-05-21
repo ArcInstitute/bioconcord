@@ -5,7 +5,7 @@ from scipy.sparse import issparse
 from statsmodels.api import OLS, add_constant
 from statsmodels.stats.multitest import multipletests
 import statsmodels.api as sm
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, t
 
 
 def _first_index_by_gene(var_names):
@@ -204,6 +204,47 @@ def fit_one_column(col, expressionMatrix, designMatrix):
     return results_df.add_prefix(f"{col}_")
 
 
+def _fit_program_regression_vectorized(expression_matrix, perturbation_codes, n_groups):
+    y = np.asarray(expression_matrix, dtype=np.float64)
+    if y.ndim == 1:
+        y = y[:, None]
+
+    non_reference_mask = perturbation_codes > 0
+    non_reference_codes = perturbation_codes[non_reference_mask] - 1
+    y_non_reference = y[non_reference_mask]
+
+    counts = np.bincount(non_reference_codes, minlength=n_groups).astype(np.float64)
+    sums = np.vstack([
+        np.bincount(non_reference_codes, weights=y_non_reference[:, col], minlength=n_groups)
+        for col in range(y.shape[1])
+    ]).T
+    squared_sums = np.vstack([
+        np.bincount(non_reference_codes, weights=y_non_reference[:, col] ** 2, minlength=n_groups)
+        for col in range(y.shape[1])
+    ]).T
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        params = sums / counts[:, None]
+        non_reference_ssr = squared_sums - (sums ** 2 / counts[:, None])
+
+    reference_sums_of_squares = (y[perturbation_codes == 0] ** 2).sum(axis=0)
+    ssr = reference_sums_of_squares + non_reference_ssr.sum(axis=0)
+    model_rank = int(np.count_nonzero(counts))
+    df_resid = y.shape[0] - model_rank
+
+    if df_resid <= 0:
+        pvalues = np.full_like(params, np.nan)
+        return params, pvalues
+
+    mse_resid = ssr / df_resid
+    with np.errstate(divide="ignore", invalid="ignore"):
+        standard_errors = np.sqrt(mse_resid[None, :] / counts[:, None])
+        tvalues = params / standard_errors
+    pvalues = 2 * t.sf(np.abs(tvalues), df_resid)
+
+    return params, pvalues
+
+
 def run_program_regression(
     adata: "AnnData",
     perturbationsColumn: str = "gene",
@@ -248,26 +289,25 @@ def run_program_regression(
         ordered=True
     )
 
-    # Design matrix (dummy coding, first level dropped = reference)
-    designMatrix = pd.get_dummies(
-        adata.obs[perturbationsColumn],
-        drop_first=True
-    )
-
     # Expression matrix: use provided pathways or default to numeric obs
     if pathways is None:
         expressionMatrix = adata.obs.select_dtypes(include="number")
     else:
         expressionMatrix = adata.obs[pathways]
 
-  
-    all_results = Parallel(n_jobs=-1)(  # -1 = use all available cores
-    delayed(fit_one_column)(col, expressionMatrix, designMatrix)
-    for col in expressionMatrix.columns)
+    perturbation_codes = adata.obs[perturbationsColumn].cat.codes.to_numpy()
+    n_groups = len(targetPerturbations) - 1
+    params, pvalues = _fit_program_regression_vectorized(
+        expressionMatrix,
+        perturbation_codes,
+        n_groups
+    )
 
-    # Concatenate side by side
-    final_results = pd.concat(all_results, axis=1)
-
+    index = pd.Index(targetPerturbations[1:])
+    final_results = pd.DataFrame(index=index)
+    for col_idx, col in enumerate(expressionMatrix.columns):
+        final_results[f"{col}_coef"] = params[:, col_idx]
+        final_results[f"{col}_pval"] = pvalues[:, col_idx]
 
     return final_results
 
