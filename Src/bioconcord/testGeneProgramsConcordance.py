@@ -6,10 +6,16 @@ from statsmodels.api import OLS, add_constant
 from statsmodels.stats.multitest import multipletests
 import statsmodels.api as sm
 from scipy.stats import pearsonr, t
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 import h5py
 import math
+import multiprocessing as mp
 import pickle
+
+
+_STREAM_WORKER_STATE = {}
+_STREAM_THREADPOOL_LIMITS = None
 
 
 def _first_index_by_gene(var_names):
@@ -152,6 +158,20 @@ def _read_h5ad_obs_column(h5, column):
     return codes, categories
 
 
+def _read_h5ad_obs_codes_slice(h5, column, start, end, category_to_code=None):
+    obj = h5["obs"][column]
+    encoding_type = obj.attrs.get("encoding-type") if isinstance(obj, h5py.Group) else None
+    if isinstance(encoding_type, bytes):
+        encoding_type = encoding_type.decode()
+    if isinstance(obj, h5py.Group) and encoding_type == "categorical":
+        return np.asarray(obj["codes"][start:end], dtype=np.int64)
+
+    if category_to_code is None:
+        raise ValueError(f"category_to_code is required for non-categorical obs column {column!r}.")
+    values = _decode_h5_values(obj[start:end])
+    return np.asarray([category_to_code[value] for value in values], dtype=np.int64)
+
+
 def _maybe_read_h5ad_obs_column(h5, column):
     if column is None or "obs" not in h5 or column not in h5["obs"]:
         return None, None
@@ -288,6 +308,14 @@ def _update_regression_accumulators(accumulators, scores, target_codes):
         )
 
 
+def _add_regression_accumulators(accumulators, partial):
+    accumulators["counts"] += partial["counts"]
+    accumulators["sums"] += partial["sums"]
+    accumulators["squared_sums"] += partial["squared_sums"]
+    accumulators["reference_sums_of_squares"] += partial["reference_sums_of_squares"]
+    accumulators["n_obs"] += partial["n_obs"]
+
+
 def _finalize_regression_accumulators(accumulators, program_names, target_perturbations):
     counts = accumulators["counts"]
     sums = accumulators["sums"]
@@ -329,6 +357,256 @@ def _coef_correlations_dataframe(pred_res, real_res):
     return pd.DataFrame(results)
 
 
+def _row_ranges(n_obs, chunk_size):
+    return [
+        (start, min(start + chunk_size, n_obs))
+        for start in range(0, n_obs, chunk_size)
+    ]
+
+
+def _multiprocessing_context(start_method=None):
+    if start_method is None:
+        start_method = "fork" if os.name != "nt" else "spawn"
+    return mp.get_context(start_method)
+
+
+def _init_stream_worker(state):
+    global _STREAM_WORKER_STATE
+    global _STREAM_THREADPOOL_LIMITS
+
+    _STREAM_WORKER_STATE = dict(state)
+    blas_threads = _STREAM_WORKER_STATE.get("worker_blas_threads")
+    if blas_threads is not None:
+        try:
+            from threadpoolctl import threadpool_limits
+            _STREAM_THREADPOOL_LIMITS = threadpool_limits(limits=blas_threads)
+            _STREAM_THREADPOOL_LIMITS.__enter__()
+        except Exception:
+            _STREAM_THREADPOOL_LIMITS = None
+
+    h5 = h5py.File(_STREAM_WORKER_STATE["adata_path"], "r")
+    _STREAM_WORKER_STATE["h5"] = h5
+    _STREAM_WORKER_STATE["X"] = h5["X"]
+
+
+def _worker_context_codes(start, end):
+    state = _STREAM_WORKER_STATE
+    if state["contextColumn"] is None:
+        return None
+    return _read_h5ad_obs_codes_slice(
+        state["h5"],
+        state["contextColumn"],
+        start,
+        end,
+        state["context_category_to_code"],
+    )
+
+
+def _worker_perturbation_codes(start, end):
+    state = _STREAM_WORKER_STATE
+    return _read_h5ad_obs_codes_slice(
+        state["h5"],
+        state["perturbationsColumn"],
+        start,
+        end,
+        state["perturbation_category_to_code"],
+    )
+
+
+def _parallel_gene_sums_worker(row_range):
+    start, end = row_range
+    state = _STREAM_WORKER_STATE
+    X = state["X"]
+    block = X[start:end, :]
+    present_context_codes = state["present_context_codes"]
+    partial_sums = {
+        code: np.zeros(state["n_vars"], dtype=np.float64)
+        for code in present_context_codes
+    }
+    partial_counts = {
+        code: 0
+        for code in present_context_codes
+    }
+
+    block_context_codes = _worker_context_codes(start, end)
+    if block_context_codes is None or len(present_context_codes) == 1:
+        context_code = present_context_codes[0]
+        partial_sums[context_code] += block.sum(axis=0, dtype=np.float64)
+        partial_counts[context_code] += block.shape[0]
+        return start, partial_sums, partial_counts
+
+    for context_code in present_context_codes:
+        mask = block_context_codes == context_code
+        if not mask.any():
+            continue
+        context_block = block[mask]
+        partial_sums[context_code] += context_block.sum(axis=0, dtype=np.float64)
+        partial_counts[context_code] += context_block.shape[0]
+
+    return start, partial_sums, partial_counts
+
+
+def _parallel_regression_worker(row_range):
+    start, end = row_range
+    state = _STREAM_WORKER_STATE
+    X = state["X"]
+    block = X[start:end, :]
+    present_context_codes = state["present_context_codes"]
+    program_names = state["program_names"]
+
+    partial_accumulators = {
+        code: _empty_regression_accumulators(
+            state["n_groups_by_context"][code],
+            len(program_names),
+        )
+        for code in present_context_codes
+    }
+
+    block_context_codes = _worker_context_codes(start, end)
+    block_perturbation_codes = _worker_perturbation_codes(start, end)
+
+    for context_code in present_context_codes:
+        if block_context_codes is None or len(present_context_codes) == 1:
+            context_block = block
+            context_perturbation_codes = block_perturbation_codes
+        else:
+            mask = block_context_codes == context_code
+            if not mask.any():
+                continue
+            context_block = block[mask]
+            context_perturbation_codes = block_perturbation_codes[mask]
+
+        if state["score_backend"] == "matrix":
+            scores = _score_block_from_matrix(
+                context_block,
+                state["score_matrices_by_context"][context_code],
+            )
+        else:
+            scores = _score_block_from_plans(
+                context_block,
+                state["plans_by_context"][context_code],
+            )
+        target_codes = state["raw_to_target_by_context"][context_code][context_perturbation_codes]
+        _update_regression_accumulators(
+            partial_accumulators[context_code],
+            scores,
+            target_codes,
+        )
+
+    return start, partial_accumulators
+
+
+def _run_parallel_gene_sums(
+    adata_path,
+    row_ranges,
+    present_context_codes,
+    n_vars,
+    contextColumn,
+    context_category_to_code,
+    n_workers,
+    worker_blas_threads,
+    multiprocessing_start_method,
+):
+    gene_sums = {
+        code: np.zeros(n_vars, dtype=np.float64)
+        for code in present_context_codes
+    }
+    context_counts = {
+        code: 0
+        for code in present_context_codes
+    }
+    state = {
+        "adata_path": str(adata_path),
+        "contextColumn": contextColumn,
+        "context_category_to_code": context_category_to_code,
+        "present_context_codes": present_context_codes,
+        "n_vars": n_vars,
+        "worker_blas_threads": worker_blas_threads,
+    }
+    mp_context = _multiprocessing_context(multiprocessing_start_method)
+    max_workers = min(n_workers, len(row_ranges))
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=mp_context,
+        initializer=_init_stream_worker,
+        initargs=(state,),
+    ) as executor:
+        for _, partial_sums, partial_counts in executor.map(
+            _parallel_gene_sums_worker,
+            row_ranges,
+            chunksize=1,
+        ):
+            for context_code in present_context_codes:
+                gene_sums[context_code] += partial_sums[context_code]
+                context_counts[context_code] += partial_counts[context_code]
+
+    return gene_sums, context_counts
+
+
+def _run_parallel_regressions(
+    adata_path,
+    row_ranges,
+    present_context_codes,
+    n_vars,
+    contextColumn,
+    context_category_to_code,
+    perturbationsColumn,
+    perturbation_category_to_code,
+    plans_by_context,
+    score_matrices_by_context,
+    raw_to_target_by_context,
+    n_groups_by_context,
+    program_names,
+    score_backend,
+    n_workers,
+    worker_blas_threads,
+    multiprocessing_start_method,
+):
+    accumulators_by_context = {
+        code: _empty_regression_accumulators(
+            n_groups_by_context[code],
+            len(program_names),
+        )
+        for code in present_context_codes
+    }
+    state = {
+        "adata_path": str(adata_path),
+        "contextColumn": contextColumn,
+        "context_category_to_code": context_category_to_code,
+        "perturbationsColumn": perturbationsColumn,
+        "perturbation_category_to_code": perturbation_category_to_code,
+        "present_context_codes": present_context_codes,
+        "n_vars": n_vars,
+        "plans_by_context": plans_by_context,
+        "score_matrices_by_context": score_matrices_by_context,
+        "raw_to_target_by_context": raw_to_target_by_context,
+        "n_groups_by_context": n_groups_by_context,
+        "program_names": program_names,
+        "score_backend": score_backend,
+        "worker_blas_threads": worker_blas_threads,
+    }
+    mp_context = _multiprocessing_context(multiprocessing_start_method)
+    max_workers = min(n_workers, len(row_ranges))
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=mp_context,
+        initializer=_init_stream_worker,
+        initargs=(state,),
+    ) as executor:
+        for _, partial_accumulators in executor.map(
+            _parallel_regression_worker,
+            row_ranges,
+            chunksize=1,
+        ):
+            for context_code in present_context_codes:
+                _add_regression_accumulators(
+                    accumulators_by_context[context_code],
+                    partial_accumulators[context_code],
+                )
+
+    return accumulators_by_context
+
+
 def _stream_program_regressions_from_h5ad(
     adata_path,
     programs_dict,
@@ -341,9 +619,14 @@ def _stream_program_regressions_from_h5ad(
     n_bins=25,
     random_state=42,
     score_backend="matrix",
+    n_workers=1,
+    worker_blas_threads=1,
+    multiprocessing_start_method=None,
 ):
     if score_backend not in {"matrix", "indexed"}:
         raise ValueError("score_backend must be 'matrix' or 'indexed'.")
+    if n_workers < 1:
+        raise ValueError("n_workers must be at least 1.")
 
     adata_path = Path(adata_path)
     with h5py.File(adata_path, "r") as h5:
@@ -352,117 +635,169 @@ def _stream_program_regressions_from_h5ad(
             raise NotImplementedError("Streaming currently supports dense h5ad X datasets only.")
 
         n_obs, n_vars = X.shape
+        x_dtype = X.dtype
         var_names = _resolve_gene_names(h5, gene_names)
         perturbation_codes, perturbation_categories = _read_h5ad_obs_column(h5, perturbationsColumn)
         context_codes, context_categories = _maybe_read_h5ad_obs_column(h5, contextColumn)
-        if context_codes is None:
-            context_codes = np.zeros(n_obs, dtype=np.int64)
-            context_categories = ["all"]
 
-        present_context_codes = [
-            code for code in range(len(context_categories))
-            if np.any(context_codes == code)
-        ]
-        context_labels = {
-            code: context_categories[code]
-            for code in present_context_codes
-        }
+    worker_context_column = contextColumn if context_codes is not None else None
+    if context_codes is None:
+        context_codes = np.zeros(n_obs, dtype=np.int64)
+        context_categories = ["all"]
 
-        gene_sums = {
-            code: np.zeros(n_vars, dtype=np.float64)
-            for code in present_context_codes
-        }
-        context_counts = {
-            code: 0
-            for code in present_context_codes
-        }
+    present_context_codes = [
+        code for code in range(len(context_categories))
+        if np.any(context_codes == code)
+    ]
+    context_labels = {
+        code: context_categories[code]
+        for code in present_context_codes
+    }
+    row_ranges = _row_ranges(n_obs, chunk_size)
+    context_category_to_code = {
+        category: idx
+        for idx, category in enumerate(context_categories)
+    }
+    perturbation_category_to_code = {
+        category: idx
+        for idx, category in enumerate(perturbation_categories)
+    }
 
-        for start in range(0, n_obs, chunk_size):
-            end = min(start + chunk_size, n_obs)
-            block = X[start:end, :]
-            block_context_codes = context_codes[start:end]
-            for context_code in present_context_codes:
-                if len(present_context_codes) == 1:
-                    context_block = block
-                else:
-                    mask = block_context_codes == context_code
-                    if not mask.any():
-                        continue
-                    context_block = block[mask]
-                gene_sums[context_code] += context_block.sum(axis=0, dtype=np.float64)
-                context_counts[context_code] += context_block.shape[0]
+    if n_workers == 1:
+        with h5py.File(adata_path, "r") as h5:
+            X = h5["X"]
+            gene_sums = {
+                code: np.zeros(n_vars, dtype=np.float64)
+                for code in present_context_codes
+            }
+            context_counts = {
+                code: 0
+                for code in present_context_codes
+            }
 
-        plans_by_context = {}
-        score_matrices_by_context = {}
-        target_perturbations_by_context = {}
-        raw_to_target_by_context = {}
-        accumulators_by_context = {}
-        program_names = list(programs_dict.keys())
-        for context_code in present_context_codes:
-            means = (gene_sums[context_code] / context_counts[context_code]).astype(X.dtype, copy=False)
-            plans_by_context[context_code] = _build_score_plans(
-                var_names,
-                means,
-                programs_dict,
-                ctrl_size=ctrl_size,
-                n_bins=n_bins,
-                random_state=random_state,
+            for start, end in row_ranges:
+                block = X[start:end, :]
+                block_context_codes = context_codes[start:end]
+                for context_code in present_context_codes:
+                    if len(present_context_codes) == 1:
+                        context_block = block
+                    else:
+                        mask = block_context_codes == context_code
+                        if not mask.any():
+                            continue
+                        context_block = block[mask]
+                    gene_sums[context_code] += context_block.sum(axis=0, dtype=np.float64)
+                    context_counts[context_code] += context_block.shape[0]
+    else:
+        gene_sums, context_counts = _run_parallel_gene_sums(
+            adata_path,
+            row_ranges,
+            present_context_codes,
+            n_vars,
+            worker_context_column,
+            context_category_to_code,
+            n_workers,
+            worker_blas_threads,
+            multiprocessing_start_method,
+        )
+
+    plans_by_context = {}
+    score_matrices_by_context = {}
+    target_perturbations_by_context = {}
+    raw_to_target_by_context = {}
+    accumulators_by_context = {}
+    n_groups_by_context = {}
+    program_names = list(programs_dict.keys())
+    for context_code in present_context_codes:
+        means = (gene_sums[context_code] / context_counts[context_code]).astype(x_dtype, copy=False)
+        plans_by_context[context_code] = _build_score_plans(
+            var_names,
+            means,
+            programs_dict,
+            ctrl_size=ctrl_size,
+            n_bins=n_bins,
+            random_state=random_state,
+        )
+        if score_backend == "matrix":
+            score_matrices_by_context[context_code] = _build_score_matrix(
+                plans_by_context[context_code],
+                n_vars,
             )
-            if score_backend == "matrix":
-                score_matrices_by_context[context_code] = _build_score_matrix(
-                    plans_by_context[context_code],
-                    n_vars,
+        context_mask = context_codes == context_code
+        target_perturbations, raw_to_target = _target_perturbations_from_codes(
+            perturbation_codes[context_mask],
+            perturbation_categories,
+            referenceLevel,
+        )
+        target_perturbations_by_context[context_code] = target_perturbations
+        raw_to_target_by_context[context_code] = raw_to_target
+        n_groups_by_context[context_code] = len(target_perturbations) - 1
+
+    if n_workers == 1:
+        with h5py.File(adata_path, "r") as h5:
+            X = h5["X"]
+            for context_code in present_context_codes:
+                accumulators_by_context[context_code] = _empty_regression_accumulators(
+                    n_groups_by_context[context_code],
+                    len(program_names),
                 )
-            context_mask = context_codes == context_code
-            target_perturbations, raw_to_target = _target_perturbations_from_codes(
-                perturbation_codes[context_mask],
-                perturbation_categories,
-                referenceLevel,
-            )
-            target_perturbations_by_context[context_code] = target_perturbations
-            raw_to_target_by_context[context_code] = raw_to_target
-            accumulators_by_context[context_code] = _empty_regression_accumulators(
-                len(target_perturbations) - 1,
-                len(program_names),
-            )
 
-        for start in range(0, n_obs, chunk_size):
-            end = min(start + chunk_size, n_obs)
-            block = X[start:end, :]
-            block_context_codes = context_codes[start:end]
-            block_perturbation_codes = perturbation_codes[start:end]
-            for context_code in present_context_codes:
-                if len(present_context_codes) == 1:
-                    context_block = block
-                    context_perturbation_codes = block_perturbation_codes
-                else:
-                    mask = block_context_codes == context_code
-                    if not mask.any():
-                        continue
-                    context_block = block[mask]
-                    context_perturbation_codes = block_perturbation_codes[mask]
+            for start, end in row_ranges:
+                block = X[start:end, :]
+                block_context_codes = context_codes[start:end]
+                block_perturbation_codes = perturbation_codes[start:end]
+                for context_code in present_context_codes:
+                    if len(present_context_codes) == 1:
+                        context_block = block
+                        context_perturbation_codes = block_perturbation_codes
+                    else:
+                        mask = block_context_codes == context_code
+                        if not mask.any():
+                            continue
+                        context_block = block[mask]
+                        context_perturbation_codes = block_perturbation_codes[mask]
 
-                if score_backend == "matrix":
-                    scores = _score_block_from_matrix(
-                        context_block,
-                        score_matrices_by_context[context_code],
+                    if score_backend == "matrix":
+                        scores = _score_block_from_matrix(
+                            context_block,
+                            score_matrices_by_context[context_code],
+                        )
+                    else:
+                        scores = _score_block_from_plans(context_block, plans_by_context[context_code])
+                    target_codes = raw_to_target_by_context[context_code][context_perturbation_codes]
+                    _update_regression_accumulators(
+                        accumulators_by_context[context_code],
+                        scores,
+                        target_codes,
                     )
-                else:
-                    scores = _score_block_from_plans(context_block, plans_by_context[context_code])
-                target_codes = raw_to_target_by_context[context_code][context_perturbation_codes]
-                _update_regression_accumulators(
-                    accumulators_by_context[context_code],
-                    scores,
-                    target_codes,
-                )
+    else:
+        accumulators_by_context = _run_parallel_regressions(
+            adata_path,
+            row_ranges,
+            present_context_codes,
+            n_vars,
+            worker_context_column,
+            context_category_to_code,
+            perturbationsColumn,
+            perturbation_category_to_code,
+            plans_by_context,
+            score_matrices_by_context,
+            raw_to_target_by_context,
+            n_groups_by_context,
+            program_names,
+            score_backend,
+            n_workers,
+            worker_blas_threads,
+            multiprocessing_start_method,
+        )
 
-        regression_results = {}
-        for context_code in present_context_codes:
-            regression_results[context_labels[context_code]] = _finalize_regression_accumulators(
-                accumulators_by_context[context_code],
-                program_names,
-                target_perturbations_by_context[context_code],
-            )
+    regression_results = {}
+    for context_code in present_context_codes:
+        regression_results[context_labels[context_code]] = _finalize_regression_accumulators(
+            accumulators_by_context[context_code],
+            program_names,
+            target_perturbations_by_context[context_code],
+        )
     return regression_results
 
 
@@ -481,6 +816,9 @@ def testGeneProgramsConcordanceStreaming(
     n_bins=25,
     random_state=42,
     score_backend="matrix",
+    n_workers=1,
+    worker_blas_threads=1,
+    multiprocessing_start_method=None,
     return_regressions=False,
 ):
     """Stream h5ad-backed dense X matrices and score each context independently.
@@ -492,6 +830,8 @@ def testGeneProgramsConcordanceStreaming(
     score_backend="matrix" computes all program scores for a chunk with one
     dense matrix multiply per context. score_backend="indexed" keeps the
     original per-program column-slicing score kernel for stricter parity checks.
+    n_workers > 1 enables deterministic multiprocessing over disjoint row
+    chunks; each worker opens its own read-only h5py handle.
     """
 
     pred_gene_names = pred_gene_names if pred_gene_names is not None else gene_names
@@ -509,6 +849,9 @@ def testGeneProgramsConcordanceStreaming(
         n_bins=n_bins,
         random_state=random_state,
         score_backend=score_backend,
+        n_workers=n_workers,
+        worker_blas_threads=worker_blas_threads,
+        multiprocessing_start_method=multiprocessing_start_method,
     )
     real_regressions = _stream_program_regressions_from_h5ad(
         real_adata_path,
@@ -522,6 +865,9 @@ def testGeneProgramsConcordanceStreaming(
         n_bins=n_bins,
         random_state=random_state,
         score_backend=score_backend,
+        n_workers=n_workers,
+        worker_blas_threads=worker_blas_threads,
+        multiprocessing_start_method=multiprocessing_start_method,
     )
 
     pred_contexts = set(pred_regressions)
