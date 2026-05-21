@@ -6,9 +6,11 @@ import statsmodels.api as sm
 from scipy.sparse import issparse
 
 from Src.bioconcord.testGeneProgramsConcordance import (
+    _coef_correlations_dataframe,
     run_program_regression,
     score_all_programs,
     score_genes_standalone,
+    testGeneProgramsConcordanceStreaming as streaming_gene_program_concordance,
 )
 
 
@@ -262,3 +264,170 @@ def test_run_program_regression_matches_statsmodels_reference_default_pathways()
     )
 
     pd.testing.assert_frame_equal(actual, expected, check_exact=False, rtol=1e-12, atol=1e-12)
+
+
+def _make_streaming_adatas():
+    rng = np.random.default_rng(123)
+    n_obs = 24
+    n_vars = 12
+    genes = [f"g{i}" for i in range(n_vars)]
+    contexts = np.array(["ctx_a", "ctx_b"] * (n_obs // 2), dtype=object)
+    perturbations = np.array(["control", "control", "a", "a", "b", "b"] * 4, dtype=object)
+
+    base = rng.normal(loc=0.0, scale=0.7, size=(n_obs, n_vars)).astype(np.float32)
+    real_x = base.copy()
+    pred_x = (base * np.float32(0.82)).astype(np.float32)
+
+    real_x[perturbations == "a", :4] += np.float32(0.65)
+    real_x[perturbations == "b", 4:8] -= np.float32(0.45)
+    real_x[contexts == "ctx_b", 8:] += np.float32(0.3)
+    pred_x[perturbations == "a", :4] += np.float32(0.55)
+    pred_x[perturbations == "b", 4:8] -= np.float32(0.35)
+    pred_x[contexts == "ctx_b", 8:] += np.float32(0.22)
+
+    obs = pd.DataFrame({
+        "context": pd.Categorical(contexts, categories=["ctx_a", "ctx_b"]),
+        "perturbation": pd.Categorical(perturbations, categories=["control", "a", "b"]),
+    }, index=[f"cell_{i}" for i in range(n_obs)])
+    var = pd.DataFrame(index=genes)
+    programs = {
+        "program_0": ["g0"],
+        "program_1": ["g4", "g5", "g6"],
+        "program_2": ["g8", "g9", "g10"],
+    }
+    return (
+        ad.AnnData(X=pred_x, obs=obs.copy(), var=var.copy()),
+        ad.AnnData(X=real_x, obs=obs.copy(), var=var.copy()),
+        programs,
+        genes,
+    )
+
+
+def _write_h5ad_with_numeric_var_names(adata, path):
+    h5ad = adata.copy()
+    h5ad.var_names = [str(i) for i in range(h5ad.n_vars)]
+    h5ad.write_h5ad(path)
+
+
+def test_streaming_h5ad_matches_context_split_in_memory(tmp_path):
+    pred_adata, real_adata, programs, genes = _make_streaming_adatas()
+    pred_path = tmp_path / "pred.h5ad"
+    real_path = tmp_path / "real.h5ad"
+    _write_h5ad_with_numeric_var_names(pred_adata, pred_path)
+    _write_h5ad_with_numeric_var_names(real_adata, real_path)
+
+    results, pred_regressions, real_regressions = streaming_gene_program_concordance(
+        pred_path,
+        real_path,
+        programs,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        contextColumn="context",
+        gene_names=genes,
+        chunk_size=5,
+        ctrl_size=2,
+        n_bins=4,
+        random_state=42,
+        return_regressions=True,
+    )
+
+    expected_results = []
+    for context in pred_regressions:
+        pred_context = pred_adata[pred_adata.obs["context"] == context].copy()
+        real_context = real_adata[real_adata.obs["context"] == context].copy()
+        score_all_programs(pred_context, programs, n_jobs=1, ctrl_size=2, n_bins=4, random_state=42)
+        score_all_programs(real_context, programs, n_jobs=1, ctrl_size=2, n_bins=4, random_state=42)
+        expected_pred = run_program_regression(
+            pred_context,
+            perturbationsColumn="perturbation",
+            referenceLevel="control",
+            pathways=programs.keys(),
+        )
+        expected_real = run_program_regression(
+            real_context,
+            perturbationsColumn="perturbation",
+            referenceLevel="control",
+            pathways=programs.keys(),
+        )
+
+        pd.testing.assert_frame_equal(
+            pred_regressions[context],
+            expected_pred,
+            check_exact=False,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        pd.testing.assert_frame_equal(
+            real_regressions[context],
+            expected_real,
+            check_exact=False,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+
+        context_results = _coef_correlations_dataframe(expected_pred, expected_real)
+        context_results.insert(0, "context", context)
+        expected_results.append(context_results)
+
+    expected_results = pd.concat(expected_results, ignore_index=True)
+    pd.testing.assert_frame_equal(results, expected_results, check_exact=False, rtol=1e-6, atol=1e-6)
+
+
+def test_streaming_h5ad_without_context_matches_whole_in_memory(tmp_path):
+    pred_adata, real_adata, programs, _ = _make_streaming_adatas()
+    pred_adata.obs = pred_adata.obs.drop(columns=["context"])
+    real_adata.obs = real_adata.obs.drop(columns=["context"])
+    pred_path = tmp_path / "pred_no_context.h5ad"
+    real_path = tmp_path / "real_no_context.h5ad"
+    pred_adata.write_h5ad(pred_path)
+    real_adata.write_h5ad(real_path)
+
+    results, pred_regressions, real_regressions = streaming_gene_program_concordance(
+        pred_path,
+        real_path,
+        programs,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        contextColumn=None,
+        chunk_size=4,
+        ctrl_size=2,
+        n_bins=4,
+        random_state=42,
+        return_regressions=True,
+    )
+
+    pred_expected_adata = pred_adata.copy()
+    real_expected_adata = real_adata.copy()
+    score_all_programs(pred_expected_adata, programs, n_jobs=1, ctrl_size=2, n_bins=4, random_state=42)
+    score_all_programs(real_expected_adata, programs, n_jobs=1, ctrl_size=2, n_bins=4, random_state=42)
+    expected_pred = run_program_regression(
+        pred_expected_adata,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        pathways=programs.keys(),
+    )
+    expected_real = run_program_regression(
+        real_expected_adata,
+        perturbationsColumn="perturbation",
+        referenceLevel="control",
+        pathways=programs.keys(),
+    )
+
+    pd.testing.assert_frame_equal(
+        pred_regressions["all"],
+        expected_pred,
+        check_exact=False,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    pd.testing.assert_frame_equal(
+        real_regressions["all"],
+        expected_real,
+        check_exact=False,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+    expected_results = _coef_correlations_dataframe(expected_pred, expected_real)
+    expected_results.insert(0, "context", "all")
+    pd.testing.assert_frame_equal(results, expected_results, check_exact=False, rtol=1e-6, atol=1e-6)

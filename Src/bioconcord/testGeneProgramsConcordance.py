@@ -6,6 +6,10 @@ from statsmodels.api import OLS, add_constant
 from statsmodels.stats.multitest import multipletests
 import statsmodels.api as sm
 from scipy.stats import pearsonr, t
+from pathlib import Path
+import h5py
+import math
+import pickle
 
 
 def _first_index_by_gene(var_names):
@@ -92,6 +96,419 @@ def _score_genes_from_context(
     scores = target_expr - control_expr
 
     return pd.Series(scores, index=context["obs_names"], name=prog_name)
+
+
+def _decode_h5_values(values):
+    return [
+        value.decode() if isinstance(value, bytes) else str(value)
+        for value in values
+    ]
+
+
+def _load_gene_names_from_path(path):
+    path = Path(path)
+    if path.suffix == ".pkl":
+        with open(path, "rb") as handle:
+            payload = pickle.load(handle)
+        if isinstance(payload, dict) and "gene_names" in payload:
+            return [str(gene) for gene in payload["gene_names"]]
+        return [str(gene) for gene in payload]
+    if path.suffix == ".npy":
+        return [str(gene) for gene in np.load(path, allow_pickle=True)]
+
+    genes = pd.read_csv(path, header=None).iloc[:, 0]
+    return [str(gene) for gene in genes]
+
+
+def _resolve_gene_names(h5, gene_names=None):
+    n_vars = h5["X"].shape[1]
+    if gene_names is None:
+        resolved = _decode_h5_values(h5["var/_index"][:])
+    elif isinstance(gene_names, (str, Path)):
+        resolved = _load_gene_names_from_path(gene_names)
+    else:
+        resolved = [str(gene) for gene in gene_names]
+
+    if len(resolved) != n_vars:
+        raise ValueError(f"gene_names has length {len(resolved)}, expected {n_vars}.")
+    return np.asarray(resolved, dtype=object)
+
+
+def _read_h5ad_obs_column(h5, column):
+    if "obs" not in h5 or column not in h5["obs"]:
+        raise KeyError(f"obs column {column!r} not found in {h5.filename}.")
+
+    obj = h5["obs"][column]
+    encoding_type = obj.attrs.get("encoding-type") if isinstance(obj, h5py.Group) else None
+    if isinstance(encoding_type, bytes):
+        encoding_type = encoding_type.decode()
+    if isinstance(obj, h5py.Group) and encoding_type == "categorical":
+        return np.asarray(obj["codes"][:], dtype=np.int64), _decode_h5_values(obj["categories"][:])
+
+    values = np.asarray(_decode_h5_values(obj[:]), dtype=object)
+    categories = list(pd.unique(values))
+    category_to_code = {category: idx for idx, category in enumerate(categories)}
+    codes = np.asarray([category_to_code[value] for value in values], dtype=np.int64)
+    return codes, categories
+
+
+def _maybe_read_h5ad_obs_column(h5, column):
+    if column is None or "obs" not in h5 or column not in h5["obs"]:
+        return None, None
+    return _read_h5ad_obs_column(h5, column)
+
+
+def _target_perturbations_from_codes(perturbation_codes, perturbation_categories, reference_level):
+    present_codes = sorted(set(int(code) for code in perturbation_codes if code >= 0))
+    target_perturbations = [perturbation_categories[code] for code in present_codes]
+    target_perturbations.sort()
+    if reference_level not in target_perturbations:
+        raise ValueError(f"referenceLevel {reference_level!r} is not present in the selected observations.")
+    target_perturbations = (
+        [reference_level]
+        + target_perturbations[:target_perturbations.index(reference_level)]
+        + target_perturbations[target_perturbations.index(reference_level) + 1:]
+    )
+    category_to_code = {category: idx for idx, category in enumerate(perturbation_categories)}
+    raw_to_target = np.full(len(perturbation_categories), -1, dtype=np.int64)
+    for idx, perturbation in enumerate(target_perturbations):
+        raw_to_target[category_to_code[perturbation]] = idx
+    return target_perturbations, raw_to_target
+
+
+def _build_score_plans(var_names, gene_means, programs_dict, ctrl_size=50, n_bins=25, random_state=42):
+    gene_to_idx = _first_index_by_gene(var_names)
+    bins = np.asarray(pd.qcut(gene_means, n_bins, labels=False, duplicates="drop"))
+    bin_members = {}
+    for idx, bin_id in enumerate(bins):
+        if pd.isna(bin_id):
+            continue
+        bin_members.setdefault(bin_id, []).append(idx)
+    bin_members = {
+        bin_id: np.asarray(indices, dtype=np.intp)
+        for bin_id, indices in bin_members.items()
+    }
+
+    plans = []
+    for prog_name, gene_list in programs_dict.items():
+        rng = np.random.default_rng(random_state)
+        if gene_list is None or len(gene_list) == 0:
+            raise ValueError("You must provide a non-empty gene_list.")
+
+        available_genes = [gene for gene in gene_list if gene in gene_to_idx]
+        if len(available_genes) == 0:
+            raise ValueError("None of the requested genes are in var_names.")
+
+        target_indices = np.asarray([gene_to_idx[gene] for gene in available_genes], dtype=np.intp)
+        control_genes = []
+        for gene_idx in target_indices:
+            gene_bin = bins[gene_idx]
+            same_bin = bin_members.get(gene_bin)
+            if same_bin is None:
+                continue
+            same_bin = same_bin[same_bin != gene_idx]
+            if len(same_bin) > 0:
+                chosen = rng.choice(same_bin, size=min(ctrl_size, len(same_bin)), replace=False)
+                control_genes.extend(chosen)
+
+        plans.append({
+            "name": prog_name,
+            "target_indices": target_indices,
+            "control_indices": np.unique(control_genes),
+        })
+    return plans
+
+
+def _score_block_from_plans(block, plans):
+    scores = np.empty((block.shape[0], len(plans)), dtype=np.float64)
+    for plan_idx, plan in enumerate(plans):
+        target_expr = block[:, plan["target_indices"]].mean(axis=1)
+        if len(plan["control_indices"]) > 0:
+            control_expr = block[:, plan["control_indices"]].mean(axis=1)
+        else:
+            control_expr = np.zeros(block.shape[0], dtype=target_expr.dtype)
+        scores[:, plan_idx] = target_expr - control_expr
+    return scores
+
+
+def _empty_regression_accumulators(n_groups, n_programs):
+    return {
+        "counts": np.zeros(n_groups, dtype=np.float64),
+        "sums": np.zeros((n_groups, n_programs), dtype=np.float64),
+        "squared_sums": np.zeros((n_groups, n_programs), dtype=np.float64),
+        "reference_sums_of_squares": np.zeros(n_programs, dtype=np.float64),
+        "n_obs": 0,
+    }
+
+
+def _update_regression_accumulators(accumulators, scores, target_codes):
+    valid_mask = target_codes >= 0
+    if not valid_mask.all():
+        scores = scores[valid_mask]
+        target_codes = target_codes[valid_mask]
+
+    accumulators["n_obs"] += len(target_codes)
+    reference_mask = target_codes == 0
+    if reference_mask.any():
+        accumulators["reference_sums_of_squares"] += (scores[reference_mask] ** 2).sum(axis=0)
+
+    non_reference_mask = target_codes > 0
+    if not non_reference_mask.any():
+        return
+
+    non_reference_codes = target_codes[non_reference_mask] - 1
+    non_reference_scores = scores[non_reference_mask]
+    n_groups = len(accumulators["counts"])
+    accumulators["counts"] += np.bincount(non_reference_codes, minlength=n_groups).astype(np.float64)
+    for col_idx in range(non_reference_scores.shape[1]):
+        accumulators["sums"][:, col_idx] += np.bincount(
+            non_reference_codes,
+            weights=non_reference_scores[:, col_idx],
+            minlength=n_groups,
+        )
+        accumulators["squared_sums"][:, col_idx] += np.bincount(
+            non_reference_codes,
+            weights=non_reference_scores[:, col_idx] ** 2,
+            minlength=n_groups,
+        )
+
+
+def _finalize_regression_accumulators(accumulators, program_names, target_perturbations):
+    counts = accumulators["counts"]
+    sums = accumulators["sums"]
+    squared_sums = accumulators["squared_sums"]
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        params = sums / counts[:, None]
+        non_reference_ssr = squared_sums - (sums ** 2 / counts[:, None])
+
+    ssr = accumulators["reference_sums_of_squares"] + non_reference_ssr.sum(axis=0)
+    model_rank = int(np.count_nonzero(counts))
+    df_resid = accumulators["n_obs"] - model_rank
+    if df_resid <= 0:
+        pvalues = np.full_like(params, np.nan)
+    else:
+        mse_resid = ssr / df_resid
+        with np.errstate(divide="ignore", invalid="ignore"):
+            standard_errors = np.sqrt(mse_resid[None, :] / counts[:, None])
+            tvalues = params / standard_errors
+        pvalues = 2 * t.sf(np.abs(tvalues), df_resid)
+
+    results = pd.DataFrame(index=pd.Index(target_perturbations[1:]))
+    for col_idx, col in enumerate(program_names):
+        results[f"{col}_coef"] = params[:, col_idx]
+        results[f"{col}_pval"] = pvalues[:, col_idx]
+    return results
+
+
+def _coef_correlations_dataframe(pred_res, real_res):
+    commonIndex = pred_res.index[[x in real_res.index for x in pred_res.index]]
+    pred_res = pred_res.loc[commonIndex,]
+    real_res = real_res.loc[commonIndex,]
+
+    coef_cols = [col for col in real_res.columns if col.endswith("_coef")]
+    results = []
+    for col in coef_cols:
+        r, p = pearsonr(real_res[col].values, pred_res[col].values)
+        results.append({"pathway": col.replace("_coef", ""), "pearson_r": r, "pval": p})
+    return pd.DataFrame(results)
+
+
+def _stream_program_regressions_from_h5ad(
+    adata_path,
+    programs_dict,
+    perturbationsColumn="gene",
+    referenceLevel="non-targeting",
+    contextColumn="context",
+    gene_names=None,
+    chunk_size=25000,
+    ctrl_size=50,
+    n_bins=25,
+    random_state=42,
+):
+    adata_path = Path(adata_path)
+    with h5py.File(adata_path, "r") as h5:
+        X = h5["X"]
+        if not isinstance(X, h5py.Dataset):
+            raise NotImplementedError("Streaming currently supports dense h5ad X datasets only.")
+
+        n_obs, n_vars = X.shape
+        var_names = _resolve_gene_names(h5, gene_names)
+        perturbation_codes, perturbation_categories = _read_h5ad_obs_column(h5, perturbationsColumn)
+        context_codes, context_categories = _maybe_read_h5ad_obs_column(h5, contextColumn)
+        if context_codes is None:
+            context_codes = np.zeros(n_obs, dtype=np.int64)
+            context_categories = ["all"]
+
+        present_context_codes = [
+            code for code in range(len(context_categories))
+            if np.any(context_codes == code)
+        ]
+        context_labels = {
+            code: context_categories[code]
+            for code in present_context_codes
+        }
+
+        gene_sums = {
+            code: np.zeros(n_vars, dtype=np.float64)
+            for code in present_context_codes
+        }
+        context_counts = {
+            code: 0
+            for code in present_context_codes
+        }
+
+        for start in range(0, n_obs, chunk_size):
+            end = min(start + chunk_size, n_obs)
+            block = X[start:end, :]
+            block_context_codes = context_codes[start:end]
+            for context_code in present_context_codes:
+                if len(present_context_codes) == 1:
+                    context_block = block
+                else:
+                    mask = block_context_codes == context_code
+                    if not mask.any():
+                        continue
+                    context_block = block[mask]
+                gene_sums[context_code] += context_block.sum(axis=0, dtype=np.float64)
+                context_counts[context_code] += context_block.shape[0]
+
+        plans_by_context = {}
+        target_perturbations_by_context = {}
+        raw_to_target_by_context = {}
+        accumulators_by_context = {}
+        program_names = list(programs_dict.keys())
+        for context_code in present_context_codes:
+            means = (gene_sums[context_code] / context_counts[context_code]).astype(X.dtype, copy=False)
+            plans_by_context[context_code] = _build_score_plans(
+                var_names,
+                means,
+                programs_dict,
+                ctrl_size=ctrl_size,
+                n_bins=n_bins,
+                random_state=random_state,
+            )
+            context_mask = context_codes == context_code
+            target_perturbations, raw_to_target = _target_perturbations_from_codes(
+                perturbation_codes[context_mask],
+                perturbation_categories,
+                referenceLevel,
+            )
+            target_perturbations_by_context[context_code] = target_perturbations
+            raw_to_target_by_context[context_code] = raw_to_target
+            accumulators_by_context[context_code] = _empty_regression_accumulators(
+                len(target_perturbations) - 1,
+                len(program_names),
+            )
+
+        for start in range(0, n_obs, chunk_size):
+            end = min(start + chunk_size, n_obs)
+            block = X[start:end, :]
+            block_context_codes = context_codes[start:end]
+            block_perturbation_codes = perturbation_codes[start:end]
+            for context_code in present_context_codes:
+                if len(present_context_codes) == 1:
+                    context_block = block
+                    context_perturbation_codes = block_perturbation_codes
+                else:
+                    mask = block_context_codes == context_code
+                    if not mask.any():
+                        continue
+                    context_block = block[mask]
+                    context_perturbation_codes = block_perturbation_codes[mask]
+
+                scores = _score_block_from_plans(context_block, plans_by_context[context_code])
+                target_codes = raw_to_target_by_context[context_code][context_perturbation_codes]
+                _update_regression_accumulators(
+                    accumulators_by_context[context_code],
+                    scores,
+                    target_codes,
+                )
+
+        regression_results = {}
+        for context_code in present_context_codes:
+            regression_results[context_labels[context_code]] = _finalize_regression_accumulators(
+                accumulators_by_context[context_code],
+                program_names,
+                target_perturbations_by_context[context_code],
+            )
+    return regression_results
+
+
+def testGeneProgramsConcordanceStreaming(
+    pred_adata_path,
+    real_adata_path,
+    programs_dict,
+    perturbationsColumn="gene",
+    referenceLevel="non-targeting",
+    contextColumn="context",
+    gene_names=None,
+    pred_gene_names=None,
+    real_gene_names=None,
+    chunk_size=25000,
+    ctrl_size=50,
+    n_bins=25,
+    random_state=42,
+    return_regressions=False,
+):
+    """Stream h5ad-backed dense X matrices and score each context independently.
+
+    This path uses h5py directly for obs metadata and X chunk reads. If
+    contextColumn is present, each context is scored with context-specific
+    expression bins and regressions, matching the result of splitting the
+    AnnData by context before calling the in-memory implementation.
+    """
+
+    pred_gene_names = pred_gene_names if pred_gene_names is not None else gene_names
+    real_gene_names = real_gene_names if real_gene_names is not None else gene_names
+
+    pred_regressions = _stream_program_regressions_from_h5ad(
+        pred_adata_path,
+        programs_dict,
+        perturbationsColumn=perturbationsColumn,
+        referenceLevel=referenceLevel,
+        contextColumn=contextColumn,
+        gene_names=pred_gene_names,
+        chunk_size=chunk_size,
+        ctrl_size=ctrl_size,
+        n_bins=n_bins,
+        random_state=random_state,
+    )
+    real_regressions = _stream_program_regressions_from_h5ad(
+        real_adata_path,
+        programs_dict,
+        perturbationsColumn=perturbationsColumn,
+        referenceLevel=referenceLevel,
+        contextColumn=contextColumn,
+        gene_names=real_gene_names,
+        chunk_size=chunk_size,
+        ctrl_size=ctrl_size,
+        n_bins=n_bins,
+        random_state=random_state,
+    )
+
+    pred_contexts = set(pred_regressions)
+    real_contexts = set(real_regressions)
+    if pred_contexts != real_contexts:
+        raise ValueError(
+            "pred and real h5ad files contain different contexts: "
+            f"pred-only={sorted(pred_contexts - real_contexts)}, "
+            f"real-only={sorted(real_contexts - pred_contexts)}."
+        )
+
+    results = []
+    for context in pred_regressions:
+        context_results = _coef_correlations_dataframe(
+            pred_regressions[context],
+            real_regressions[context],
+        )
+        context_results.insert(0, "context", context)
+        results.append(context_results)
+
+    results_df = pd.concat(results, ignore_index=True)
+    if return_regressions:
+        return results_df, pred_regressions, real_regressions
+    return results_df
 
 
 def score_genes_standalone(
@@ -401,3 +818,7 @@ def testGeneProgramsConcordance(pred_adata, real_adata,
     results_df = plot_coef_correlations(pred_res, real_res,ncols, figsize_per_plot, save_path)
 
     return results_df
+
+
+testGeneProgramsConcordance.__test__ = False
+testGeneProgramsConcordanceStreaming.__test__ = False
