@@ -8,6 +8,92 @@ import statsmodels.api as sm
 from scipy.stats import pearsonr
 
 
+def _first_index_by_gene(var_names):
+    gene_to_idx = {}
+    for idx, gene in enumerate(var_names):
+        if gene not in gene_to_idx:
+            gene_to_idx[gene] = idx
+    return gene_to_idx
+
+
+def _prepare_score_context(adata, n_bins=25):
+    X = adata.X
+    var_names = np.array(adata.var_names)
+
+    if issparse(X):
+        gene_means = np.array(X.mean(axis=0)).ravel()
+    else:
+        gene_means = X.mean(axis=0)
+
+    bins = np.asarray(pd.qcut(gene_means, n_bins, labels=False, duplicates="drop"))
+    bin_members = {}
+    for idx, bin_id in enumerate(bins):
+        if pd.isna(bin_id):
+            continue
+        bin_members.setdefault(bin_id, []).append(idx)
+    bin_members = {
+        bin_id: np.asarray(indices, dtype=np.intp)
+        for bin_id, indices in bin_members.items()
+    }
+
+    return {
+        "X": X,
+        "obs_names": adata.obs_names,
+        "var_names": var_names,
+        "gene_to_idx": _first_index_by_gene(var_names),
+        "bins": bins,
+        "bin_members": bin_members,
+    }
+
+
+def _score_genes_from_context(
+    context,
+    prog_name,
+    gene_list=None,
+    ctrl_size=50,
+    random_state=0
+):
+    X = context["X"]
+    gene_to_idx = context["gene_to_idx"]
+    bins = context["bins"]
+    bin_members = context["bin_members"]
+
+    rng = np.random.default_rng(random_state)
+
+    if gene_list is None or len(gene_list) == 0:
+        raise ValueError("You must provide a non-empty gene_list.")
+
+    gene_list = [g for g in gene_list if g in gene_to_idx]
+    if len(gene_list) == 0:
+        raise ValueError("None of the requested genes are in var_names.")
+
+    target_indices = [gene_to_idx[g] for g in gene_list]
+
+    control_genes = []
+    for g_idx in target_indices:
+        g_bin = bins[g_idx]
+        same_bin = bin_members.get(g_bin)
+        if same_bin is None:
+            continue
+        same_bin = same_bin[same_bin != g_idx]
+        if len(same_bin) > 0:
+            chosen = rng.choice(same_bin, size=min(ctrl_size, len(same_bin)), replace=False)
+            control_genes.extend(chosen)
+
+    control_genes = np.unique(control_genes)
+
+    if issparse(X):
+        target_expr = np.array(X[:, target_indices].mean(axis=1)).ravel()
+        control_expr = np.array(X[:, control_genes].mean(axis=1)).ravel() if len(control_genes) > 0 else np.zeros(X.shape[0])
+    else:
+        target_expr = X[:, target_indices].mean(axis=1)
+        control_expr = X[:, control_genes].mean(axis=1) if len(control_genes) > 0 else np.zeros(X.shape[0])
+
+    scores = target_expr - control_expr
+
+    return pd.Series(scores, index=context["obs_names"], name=prog_name)
+
+
 def score_genes_standalone(
     adata,
     prog_name,
@@ -48,56 +134,17 @@ def score_genes_standalone(
         Gene scores for each cell (index = obs_names or range(n_cells)).
     """
 
-    X = adata.X 
-    var_names = adata.var_names
-
-    rng = np.random.default_rng(random_state)
-
-    var_names = np.array(var_names)
-    if gene_list is None or len(gene_list) == 0:
-        raise ValueError("You must provide a non-empty gene_list.")
-
-    # restrict to available genes
-    gene_list = [g for g in gene_list if g in var_names]
-    if len(gene_list) == 0:
-        raise ValueError("None of the requested genes are in var_names.")
-
-    # convert X to dense if needed for per-gene means
-    if issparse(X):
-        gene_means = np.array(X.mean(axis=0)).ravel()
-    else:
-        gene_means = X.mean(axis=0)
-
-    # bin genes by mean expression
-    bins = pd.qcut(gene_means, n_bins, labels=False, duplicates="drop")
-
-    # collect control genes matched by bins
-    control_genes = []
-    for g in gene_list:
-        g_idx = np.where(var_names == g)[0][0]
-        g_bin = bins[g_idx]
-        same_bin = np.where(bins == g_bin)[0]
-        same_bin = same_bin[same_bin != g_idx]  # exclude the gene itself
-        if len(same_bin) > 0:
-            chosen = rng.choice(same_bin, size=min(ctrl_size, len(same_bin)), replace=False)
-            control_genes.extend(chosen)
-
-    control_genes = np.unique(control_genes)
-
-    # expression for gene set and control set
-    if issparse(X):
-        target_expr = np.array(X[:, [np.where(var_names == g)[0][0] for g in gene_list]].mean(axis=1)).ravel()
-        control_expr = np.array(X[:, control_genes].mean(axis=1)).ravel() if len(control_genes) > 0 else np.zeros(X.shape[0])
-    else:
-        target_expr = X[:, [np.where(var_names == g)[0][0] for g in gene_list]].mean(axis=1)
-        control_expr = X[:, control_genes].mean(axis=1) if len(control_genes) > 0 else np.zeros(X.shape[0])
-
-    scores = target_expr - control_expr
-
-    return pd.Series(scores, index=adata.obs_names, name=prog_name)
+    context = _prepare_score_context(adata, n_bins=n_bins)
+    return _score_genes_from_context(
+        context,
+        prog_name,
+        gene_list=gene_list,
+        ctrl_size=ctrl_size,
+        random_state=random_state
+    )
 
 
-def score_all_programs(adata, programs_dict, n_jobs=15):
+def score_all_programs(adata, programs_dict, n_jobs=15, ctrl_size=50, n_bins=25, random_state=42):
     """
     Compute scores for each gene set (program) in parallel and update adata.obs.
 
@@ -113,12 +160,27 @@ def score_all_programs(adata, programs_dict, n_jobs=15):
 
     n_jobs : int, optional (default=15)
         Number of parallel processes to use when computing program scores.
+
+    ctrl_size : int, optional (default=50)
+        Number of control genes randomly sampled per target gene.
+
+    n_bins : int, optional (default=25)
+        Number of expression bins used to match control genes.
+
+    random_state : int, optional (default=42)
+        Random seed used for each program's control gene sampling.
         
     """
 
-    
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(score_genes_standalone)(adata, prog_name, gene_list, random_state=42)
+    context = _prepare_score_context(adata, n_bins=n_bins)
+    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(_score_genes_from_context)(
+            context,
+            prog_name,
+            gene_list=gene_list,
+            ctrl_size=ctrl_size,
+            random_state=random_state
+        )
         for prog_name, gene_list in programs_dict.items()
     )
 
@@ -285,8 +347,8 @@ def plot_coef_correlations(pred_res, real_res, ncols=5, figsize_per_plot=5, save
 
     return pd.DataFrame(results)
 
-def testGeneProgramsConcordance(pred_adata, real_adata, 
-                                programs_dict, perturbationsColumn="gene", 
+def testGeneProgramsConcordance(pred_adata, real_adata,
+                                programs_dict, perturbationsColumn="gene",
                                 referenceLevel="non-targeting",ncols=5, figsize_per_plot=5, save_path=None):
 
     pred_adata = score_all_programs(pred_adata, programs_dict)
@@ -297,10 +359,5 @@ def testGeneProgramsConcordance(pred_adata, real_adata,
 
 
     results_df = plot_coef_correlations(pred_res, real_res,ncols, figsize_per_plot, save_path)
-    
+
     return results_df
-    
- 
-    
-    
-  
