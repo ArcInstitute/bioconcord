@@ -192,6 +192,12 @@ def run_program_regression(
         drop_first=True
     )
 
+    # Add an intercept so the reference level anchors the baseline:
+    # intercept = reference (referenceLevel) mean, and each dummy coefficient
+    # is the contrast (perturbation mean - reference mean). Without it the OLS
+    # has no baseline term and coefficients collapse to absolute group means.
+    designMatrix = add_constant(designMatrix)
+
     # Expression matrix: use provided pathways or default to numeric obs
     if pathways is None:
         expressionMatrix = adata.obs.select_dtypes(include="number")
